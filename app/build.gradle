@@ -17,10 +17,35 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    def signingPropertiesFile = file("signing.properties")
+    def signingProperties = null
+    if (signingPropertiesFile.exists()) {
+        signingProperties = new Properties()
+        signingProperties.load(new FileInputStream(signingPropertiesFile))
+    } else {
+        println("Local signing.properties file not found, falling back to default.")
+    }
+
+    if (signingProperties != null) {
+        signingConfigs {
+            release {
+                storeFile file(signingProperties['KEYSTORE_FILE'])
+                storePassword signingProperties['KEYSTORE_PASSWORD']
+                keyAlias signingProperties['KEY_ALIAS']
+                keyPassword signingProperties['KEY_PASSWORD']
+            }
+        }
+    }
+
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            def signingConfigLocal = signingConfigs.findByName("release")
+            if (signingConfigLocal != null) {
+                signingConfig signingConfigLocal
+            }
         }
     }
 
