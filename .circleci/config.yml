@@ -1,0 +1,271 @@
+# Use the latest 2.1 version of CircleCI pipeline process engine.
+# See: https://circleci.com/docs/configuration-reference
+version: 2.1
+
+orbs:
+  android: circleci/android@2.1.2
+
+parameters:
+  pull_request_trigger:
+    type: boolean
+    default: true
+  qa_build_variants:
+    type: string
+    default: ""
+  qa_message:
+    type: string
+    default: ""
+  qa_trigger:
+    type: boolean
+    default: false
+
+# Define a job to be invoked later in a workflow.
+# See: https://circleci.com/docs/jobs-steps/#jobs-overview & https://circleci.com/docs/configuration-reference/#jobs
+jobs:
+  deploy:
+    docker:
+      - image: cimg/android:2024.01
+    environment:
+      DEPLOY_DIR: deploy
+    steps:
+      - checkout
+      - android/restore-gradle-cache
+      - run:
+          name: Generate deploy directory
+          command: |
+            mkdir ${DEPLOY_DIR}
+      - run:
+          name: Generate keystore related files
+          command: |
+            # Decode keystore.
+            echo ${KEYSTORE_FILE} | base64 -d | tee app/sign-key-upload.keystore > /dev/null
+
+            # Create signing.properties.
+            printf "KEYSTORE_FILE=sign-key-upload.keystore\nKEYSTORE_PASSWORD=%s\nKEY_ALIAS=%s\nKEY_PASSWORD=%s" ${KEYSTORE_PASSWORD} ${KEY_ALIAS} ${KEY_PASSWORD} > app/signing.properties
+      - run:
+          name: Build aab
+          command: |
+            # Build aab
+            ./gradlew app:bundleRelease
+      - android/save-gradle-cache
+      - run:
+          name: Move build result files to deploy directory
+          command: |
+            # Move the build result files to deploy directory.
+            find */build/outputs -type f \( -name \*.apk -o -name \*.aab -o -name mapping.txt \) -exec cp {} ${DEPLOY_DIR} \;
+      - run:
+          name: Export universal apk from aab
+          command: |
+            bundle_tool_version="1.15.6"
+            bundle_tool_file="bundletool-all-${bundle_tool_version}.jar"
+
+            file_name="app-release"
+
+            keystore_file="app/sign-key-upload.keystore"
+            
+            # Download BundleTool.
+            curl -LJO https://github.com/google/bundletool/releases/download/${bundle_tool_version}/${bundle_tool_file}
+            
+            # Export universal apk from aab.
+            java -jar ${bundle_tool_file} build-apks \
+            --bundle=${DEPLOY_DIR}/${file_name}.aab \
+            --output=${file_name}.apks \
+            --ks=${keystore_file} \
+            --ks-pass=pass:${KEYSTORE_PASSWORD} \
+            --ks-key-alias=${KEY_ALIAS} \
+            --key-pass=pass:${KEY_PASSWORD} \
+            --mode=universal
+
+            mv ${file_name}.apks ${file_name}.zip
+            unzip -o -d universal/ ${file_name}.zip > /dev/null
+            rm -rf ${file_name}.zip
+            mv universal/universal.apk universal/${file_name}.apk
+            
+            # Move exported APK to deploy directory.
+            find universal -type f -name "*.apk" -exec cp {} ${DEPLOY_DIR} \;
+            rm -rf universal
+      - run:
+          name: Upload build results to GitHub release
+          command: |
+            # Create GitHub release.
+            upload_url_origin=$(curl --request POST \
+              --url https://api.github.com/repos/timmy80713/android-cicd-circleci/releases \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: token ${GITHUB_PERSONAL_ACCESS_TOKEN}" \
+              --data "{\"tag_name\": \"${CIRCLE_TAG}\", \"name\": \"${CIRCLE_TAG}\", \"body\": \"Upload from CircleCI.\"}" | jq -r '.upload_url')
+            upload_url=${upload_url_origin%"{?name,label}"}
+
+            # Upload assets to GitHub release.
+            curl --request POST \
+              --url ${upload_url}\?name\=app-${CIRCLE_TAG}.apk \
+              --header "Accept: application/vnd.github.v3+json" \
+              --header "Authorization: token ${GITHUB_PERSONAL_ACCESS_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary @${DEPLOY_DIR}/app-release.apk | cat
+
+            curl --request POST \
+              --url ${upload_url}\?name\=app-${CIRCLE_TAG}.aab \
+              --header "Accept: application/vnd.github.v3+json" \
+              --header "Authorization: token ${GITHUB_PERSONAL_ACCESS_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary @${DEPLOY_DIR}/app-release.aab | cat
+
+            curl --request POST \
+              --url ${upload_url}\?name\=mapping.txt \
+              --header "Accept: application/vnd.github.v3+json" \
+              --header "Authorization: token ${GITHUB_PERSONAL_ACCESS_TOKEN}" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary @${DEPLOY_DIR}/mapping.txt | cat
+
+  pull_request:
+    docker:
+      - image: cimg/android:2024.01
+    steps:
+      - checkout
+      - android/restore-gradle-cache
+      - run:
+          name: Run unit test
+          command: |
+            ./gradlew testDebugUnitTest
+      - android/save-gradle-cache
+  qa:
+    docker:
+      - image: cimg/android:2024.01
+    environment:
+      DEPLOY_DIR: deploy
+      QA_BUILD_VARIANTS: << pipeline.parameters.qa_build_variants >>
+      QA_MESSAGE: << pipeline.parameters.qa_message >>
+    steps:
+      - checkout
+      - android/restore-gradle-cache
+      - run:
+          name: Generate deploy directory
+          command: |
+            mkdir ${DEPLOY_DIR}
+      - run:
+          name: Generate keystore related files
+          command: |
+            # Decode keystore.
+            echo ${KEYSTORE_FILE} | base64 -d | tee app/sign-key-upload.keystore > /dev/null
+
+            # Create signing.properties.
+            printf "KEYSTORE_FILE=sign-key-upload.keystore\nKEYSTORE_PASSWORD=%s\nKEY_ALIAS=%s\nKEY_PASSWORD=%s" ${KEYSTORE_PASSWORD} ${KEY_ALIAS} ${KEY_PASSWORD} > app/signing.properties
+      - run:
+          name: Build apk
+          command: |
+            # Generate gradle tasks.
+            gradle_task=""
+            for variant in $(echo -e "${QA_BUILD_VARIANTS}")
+            do
+              echo ${variant}
+              gradle_task="${gradle_task} app:assemble${variant}"
+            done
+            ./gradlew ${gradle_task}
+      - android/save-gradle-cache
+      - run:
+          name: Move build result files to deploy directory
+          command: |
+            # Move the build result files to deploy directory.
+            find */build/outputs -type f \( -name \*.apk -o -name \*.aab -o -name mapping.txt \) -exec cp {} ${DEPLOY_DIR} \;
+      - run:
+          name: Rename apk
+          command: |
+            timestamp=`date +%Y%m%d%H%M%S`
+            for file in ${DEPLOY_DIR}/*.apk
+            do mv ${file} `echo ${file} | sed "s/app-//" | sed "s/.apk/-$(echo ${CIRCLE_BRANCH} | sed "s@\/@-@g" | sed "s/_/-/g")-${timestamp}.apk/"`
+            done
+      - store_artifacts:
+          path: deploy
+      - run:
+          name: Send a success message to the Slack channel
+          when: on_success
+          command: |
+            # Get artifacts.
+            response=$(curl --request GET \
+              --url "https://circleci.com/api/v2/project/gh/timmy80713/android-cicd-circleci/${CIRCLE_BUILD_NUM}/artifacts" \
+              --header "Accept: application/json" \
+              --user "${CIRCLE_API_TOKEN}:")
+
+            # Parse response to Slack actions.
+            slack_actions_string=$(jq '.items[].path |= sub("deploy\/";"Download ")' \<<< ${response} | jq '[.items[] | { text: .path , url: .url }]' | jq '.[] += { type: "button" }')
+
+            git_commit_message_subject=$(git "log" "-1" "--format=%s")
+            timestamp=`date +%s`
+
+            # Send message to Slack channel.
+            curl --request POST \
+              --url "${SLACK_WEBHOOK_URL}" \
+              --header "Content-type:application/json" \
+              --data "{
+                          \"icon_emoji\": \":smiley:\",
+                          \"username\": \"Build Succeeded!\",
+                          \"text\": \"${QA_MESSAGE}\",
+                          \"attachments\": [
+                              {
+                                  \"color\": \"#3BC3A3\",
+                                  \"title\": \"#${CIRCLE_BUILD_NUM} ${CIRCLE_BRANCH}\",
+                                  \"title_link\": \"${CIRCLE_BUILD_URL}\",
+                                  \"text\": \"${git_commit_message_subject}\",
+                                  \"footer\": \"CircleCI\",
+                                  \"footer_icon\": \"https://a.slack-edge.com/80588/img/plugins/circleci/service_64.png\",
+                                  \"ts\": ${timestamp},
+                                  \"actions\": ${slack_actions_string}
+                              }
+                          ]
+                      }"
+      - run:
+          name: Send a failure message to Slack channel
+          when: on_fail
+          command: |
+            git_commit_message_subject=$(git "log" "-1" "--format=%s")
+            timestamp=`date +%s`
+
+            # Send message to Slack channel
+            curl --request POST \
+              --url "${SLACK_WEBHOOK_URL}" \
+              --header "Content-type:application/json" \
+              --data "{
+                          \"icon_emoji\": \":smiling_face_with_tear:\",
+                          \"username\": \"Build Failed!\",
+                          \"text\": \"${QA_MESSAGE}\",
+                          \"attachments\": [
+                              {
+                                  \"color\": \"#F0741F\",
+                                  \"title\": \"#${CIRCLE_BUILD_NUM} ${CIRCLE_BRANCH}\",
+                                  \"title_link\": \"${CIRCLE_BUILD_URL}\",
+                                  \"text\": \"${git_commit_message_subject}\",
+                                  \"footer\": \"CircleCI\",
+                                  \"footer_icon\": \"https://a.slack-edge.com/80588/img/plugins/circleci/service_64.png\",
+                                  \"ts\": ${timestamp}
+                              }
+                          ]
+                      }"
+
+# Orchestrate jobs using workflows
+# See: https://circleci.com/docs/workflows/ & https://circleci.com/docs/configuration-reference/#workflows
+workflows:
+  deploy:
+    jobs:
+      - deploy:
+          filters:
+            tags:
+              only: /\d+.\d+.\d/
+            branches:
+              ignore: /.*/
+  pull_request:
+    when:
+      and:
+        - << pipeline.parameters.pull_request_trigger >>
+        - not:
+            equal: [ develop, << pipeline.git.branch >> ]
+    jobs:
+      - pull_request
+  qa:
+    when:
+      and:
+        - << pipeline.parameters.qa_trigger >>
+        - not:
+            equal: [ "", << pipeline.parameters.qa_build_variants >> ]
+    jobs:
+      - qa:
+          context: Slack
