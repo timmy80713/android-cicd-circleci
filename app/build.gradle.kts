@@ -1,3 +1,6 @@
+import java.io.FileInputStream
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -17,9 +20,26 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        val signingPropertiesFile = file("signing.properties")
+        if (signingPropertiesFile.exists()) {
+            Properties().apply { load(FileInputStream(signingPropertiesFile)) }.also {
+                create("release") {
+                    storeFile = file(it["KEYSTORE_FILE"]!!)
+                    storePassword = it["KEYSTORE_PASSWORD"]!!.toString()
+                    keyAlias = it["KEY_ALIAS"]!!.toString()
+                    keyPassword = it["KEY_PASSWORD"]!!.toString()
+                }
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
+            isDebuggable = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
